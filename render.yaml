@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mmls-ai-api
+    runtime: python
+    buildCommand: pip install -r requirements_api.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: MONGO_URI
+        sync: false
+      - key: PORT
+        value: 10000
