@@ -179,6 +179,7 @@ def forecast():
                     predicted = base_rate * (1 + tempo)
             else:
                 predicted = base_rate * (1 + tempo)
+            predicted = max(0.0, predicted)
             hos, tier = compute_hos(stock, predicted) if predicted > 0 else (999, "GREEN")
             predictions.append({
                 "item_id": item["item_id"], "item_name": item["item_name"],
@@ -233,12 +234,18 @@ def register_item():
             return jsonify({"error": "item_id is required"}), 400
         if inventory_col.find_one({"item_id": item_id}):
             return jsonify({"error": f"{item_id} already exists"}), 409
+        
         expiry_days = int(data.get("expiry_days", 365))
+        
         doc = {
+            # Basic info
             "item_id":                  item_id,
             "item_name":                str(data.get("item_name", item_id)),
             "category":                 str(data.get("category", "Other")),
             "echelon":                  str(data.get("echelon", "Role1")),
+            "unit":                     str(data.get("unit", "ea")),
+            
+            # Stock & AI variables
             "controlled_drug":          bool(data.get("controlled_drug", False)),
             "current_stock":            int(data.get("current_stock", 0)),
             "initial_stock":            int(data.get("current_stock", 0)),
@@ -246,9 +253,24 @@ def register_item():
             "avg_consumption_per_hour": float(data.get("avg_consumption_per_hour", 1.0)),
             "expiry_date":              datetime.now() + timedelta(days=expiry_days),
             "pack_type":                str(data.get("pack_type", "Standalone")),
+            
+            # Medical specifications & NATO/DLA details
+            "role1":                    str(data.get("role1", "—")),
+            "role2":                    str(data.get("role2", "—")),
+            "role2_plus":               str(data.get("role2_plus", "—")),
+            "fst":                      str(data.get("fst", "—")),
+            "role3":                    str(data.get("role3", "—")),
+            "fsc":                      str(data.get("fsc", "—")),
+            "contents":                 str(data.get("contents", "—")),
+            "cotccc":                   str(data.get("cotccc", "—")),
+            "sterile":                  str(data.get("sterile", "YES")),
+            "notes":                    str(data.get("notes", "—")),
+            
+            # Metadata
             "last_updated":             datetime.now(),
-            "registered_via":           "QR_SCAN",
+            "registered_via":           "QR_SCAN_OR_MANUAL",
         }
+        
         inventory_col.insert_one(doc)
         return jsonify({"message": f"{item_id} registered successfully", "item_id": item_id}), 200
     except Exception as e:
