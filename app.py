@@ -276,6 +276,45 @@ def register_item():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── ENDPOINT 8 — POST /delete_items ──────────────────────────────────────────
+@app.route("/delete_items", methods=["POST"])
+def delete_items():
+    try:
+        data = request.json
+        item_ids_to_delete = data.get("item_ids", [])
+        
+        if not item_ids_to_delete:
+            return jsonify({"error": "No items provided"}), 400
+
+        # Delete all documents matching the provided item IDs
+        result = inventory_col.delete_many({"item_id": {"$in": item_ids_to_delete}})
+
+        return jsonify({
+            "message": "Items deleted successfully", 
+            "deleted_count": result.deleted_count
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── ENDPOINT 9 — POST /reset ─────────────────────────────────────────────────
+@app.route("/reset", methods=["POST"])
+def reset_database():
+    try:
+        # Wipe the entire inventory collection
+        inv_result = inventory_col.delete_many({})
+        # Wipe the audit log so you start with a completely clean slate
+        audit_result = audit_col.delete_many({})
+        
+        return jsonify({
+            "message": "Database wiped successfully",
+            "inventory_deleted": inv_result.deleted_count,
+            "audit_deleted": audit_result.deleted_count
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # ── Health check ──────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
