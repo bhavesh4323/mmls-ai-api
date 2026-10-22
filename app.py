@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
+from lsco_twin.api import twin_bp
 
 # ── Config ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -23,13 +24,20 @@ db         = client["mmls_ai"]
 inventory_col = db["inventory"]
 audit_col     = db["audit_log"]
 
+def _inventory_collections():
+    return inventory_col, audit_col
+
+
+app.config["MMLS_AI_COLLECTIONS"] = _inventory_collections
+app.register_blueprint(twin_bp)
+
 # Load XGBoost model
 try:
     model = joblib.load("model.pkl")
-    print("✅ XGBoost model loaded")
-except:
+    print("XGBoost model loaded")
+except Exception as exc:
     model = None
-    print("⚠️ model.pkl not found")
+    print(f"XGBoost model unavailable; using baseline predictor: {exc}")
 
 # ── Hours of Supply Engine ────────────────────────────────────────────────────
 def get_hos_tier(hours):
