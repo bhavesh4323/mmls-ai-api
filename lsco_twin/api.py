@@ -258,12 +258,27 @@ def mc_endpoint():
                     kwargs[key] = cast(raw)
             except (ValueError, TypeError):
                 return jsonify({"error": f"{key} must be {cast}"}), 400
-        n_runs = kwargs.pop("mc_runs", 50)
+        requested_runs = kwargs.pop("mc_runs", 50)
         policy = request.args.get("policy", "dynamic")
         if policy not in ("static", "dynamic"):
             return jsonify({"error": "policy must be static or dynamic"}), 400
         cfg = Config(**kwargs)
-        result = monte_carlo(cfg, n_runs=n_runs, policy=policy)
+        # Free-tier guard: keep the request inside Render's ~100s idle timeout
+        # (0.1 CPU ≈ 2 simulated run-hours per second of wall time).
+        max_run_hours = 15000
+        n_runs = requested_runs
+        if cfg.T * n_runs > max_run_hours:
+            n_runs = max(5, int(max_run_hours // cfg.T))
+        try:
+            result = monte_carlo(cfg, n_runs=n_runs, policy=policy)
+        except MemoryError:
+            return jsonify({"error": "out of memory - reduce the number of runs or simulation days"}), 400
+        except Exception as exc:  # never leak a bare Flask 500 to the dashboard
+            current_app.logger.exception("monte-carlo run failed")
+            return jsonify({"error": f"Monte Carlo failed: {type(exc).__name__}: {exc}"}), 500
+        result["requested_runs"] = requested_runs
+        result["note"] = ("run count capped to fit free-tier compute limits"
+                          if n_runs < requested_runs else None)
         return jsonify(result)
     except (ValueError, TypeError, OverflowError) as exc:
         return jsonify({"error": str(exc)}), 400

@@ -30,7 +30,7 @@ def hos_tier(h):
     if h >= 2:  return "RED"
     return "PURPLE"
 
-def run(cfg: Config, policy: str = "dynamic", world: World = None):
+def run(cfg: Config, policy: str = "dynamic", world: World = None, light: bool = False):
     w = world or World(cfg)
     rng = np.random.default_rng(cfg.seed + 1)
     T, N, K = cfg.T, w.N, len(ITEMS)
@@ -58,8 +58,12 @@ def run(cfg: Config, policy: str = "dynamic", world: World = None):
     maxd = max(delay.values()) + 2
     pipe, pipe_nom = np.zeros((T + maxd, N, K)), np.zeros((T + maxd, N, K))
     transit = np.zeros((N, K))
-    unmet, stock_hist = np.zeros((T, N, K)), np.zeros((T, N, K), dtype=np.float32)
-    rate_hist = np.zeros((T, N, K), dtype=np.float32); rate = planned.copy()
+    unmet = np.zeros((T, N, K), dtype=np.float32)
+    # light mode (Monte Carlo): only unmet demand is needed for summary stats,
+    # so skip the full stock/rate histories to stay within free-tier memory.
+    stock_hist = None if light else np.zeros((T, N, K), dtype=np.float32)
+    rate_hist = None if light else np.zeros((T, N, K), dtype=np.float32)
+    rate = planned.copy()
     for t in range(T):
         stock += pipe[t]; transit -= pipe_nom[t]; transit = np.maximum(transit, 0)
         stock[0] += wh_in_h
@@ -110,7 +114,8 @@ def run(cfg: Config, policy: str = "dynamic", world: World = None):
                 arrive = ship * (~lost)[:, None]
                 ta = t + delay[L]
                 pipe[ta, idx] += arrive; pipe_nom[ta, idx] += ship; transit[idx] += ship
-        stock_hist[t] = stock; rate_hist[t] = rate
+        if not light:
+            stock_hist[t] = stock; rate_hist[t] = rate
     return Result(cfg, w, policy, unmet, stock_hist, rate_hist)
 
 class Result:
@@ -163,7 +168,7 @@ def monte_carlo(cfg: Config, n_runs: int = None, policy: str = "dynamic") -> dic
     for i in range(n):
         run_cfg = Config(**{k: v for k, v in cfg.__dict__.items() if k != 'seed'})
         run_cfg.seed = cfg.mc_seed_base + i
-        res = run(run_cfg, policy=policy)
+        res = run(run_cfg, policy=policy, light=True)
         summary = res.summary()
         blood_rows = summary[summary["item"].isin(BLOOD_ITEMS)] if not summary.empty else pd.DataFrame()
         blood_stockout = int(blood_rows["first_stockout_day"].dropna().min()) if not blood_rows.empty and blood_rows["first_stockout_day"].notna().any() else None
@@ -174,6 +179,7 @@ def monte_carlo(cfg: Config, n_runs: int = None, policy: str = "dynamic") -> dic
             "first_stockout_day": int(summary["first_stockout_day"].dropna().min()) if not summary.empty and summary["first_stockout_day"].notna().any() else None,
             "blood_stockout_day": blood_stockout,
         })
+        del res, summary, blood_rows   # free per-run arrays promptly on small-memory instances
     # Compute distribution summary
     fills = [r["overall_fill_rate_pct"] for r in results]
     stockouts = [r["first_stockout_day"] for r in results if r["first_stockout_day"] is not None]
