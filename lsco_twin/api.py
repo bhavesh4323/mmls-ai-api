@@ -41,16 +41,16 @@ def _cfg_from(args):
         raise ValueError("days must be 1-60")
     if not 1 <= cfg.surge_mult <= 10:
         raise ValueError("surge_mult must be 1-10")
-    if "surge_start_h" in values and not 0 <= cfg.surge_start_h < cfg.T:
-        raise ValueError("surge_start_h must be within the simulation")
+    if "surge_start_h" in values and cfg.surge_start_h < 0:
+        raise ValueError("surge_start_h must be non-negative")
     if not 0 <= cfg.evac_factor <= 5:
         raise ValueError("evac_factor must be 0-5")
     if not 0 <= cfg.lift_factor <= 5:
         raise ValueError("lift_factor must be 0-5")
-    if not -1 <= cfg.depot_loss_h < cfg.T:
-        raise ValueError("depot_loss_h must be -1 or within the simulation")
-    if not -1 <= cfg.cold_chain_loss_h < cfg.T:
-        raise ValueError("cold_chain_loss_h must be -1 or within the simulation")
+    if cfg.depot_loss_h < -1:
+        raise ValueError("depot_loss_h must be -1 or a positive hour")
+    if cfg.cold_chain_loss_h < -1:
+        raise ValueError("cold_chain_loss_h must be -1 or a positive hour")
     if not 0 <= cfg.blood_spoil_h <= 0.5:
         raise ValueError("blood_spoil_h must be 0-0.5 (fractional hourly loss)")
     if not 0 <= cfg.wbb_units_per_day <= 200:
