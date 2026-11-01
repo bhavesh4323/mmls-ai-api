@@ -259,8 +259,11 @@ def mc_endpoint():
             except (ValueError, TypeError):
                 return jsonify({"error": f"{key} must be {cast}"}), 400
         n_runs = kwargs.pop("mc_runs", 50)
+        policy = request.args.get("policy", "dynamic")
+        if policy not in ("static", "dynamic"):
+            return jsonify({"error": "policy must be static or dynamic"}), 400
         cfg = Config(**kwargs)
-        result = monte_carlo(cfg, n_runs=n_runs)
+        result = monte_carlo(cfg, n_runs=n_runs, policy=policy)
         return jsonify(result)
     except (ValueError, TypeError, OverflowError) as exc:
         return jsonify({"error": str(exc)}), 400
