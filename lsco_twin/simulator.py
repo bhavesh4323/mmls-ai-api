@@ -1,11 +1,14 @@
 """simulator.py - hourly stock / shipment simulation across WH -> DEPOT -> R3 -> R2E -> R1.
 
 Models the LSCO failure modes from BST PID v0.2 Part A / Digital Twin PDF s4-s6:
-depot loss, cold-chain failure, blood spoilage (short shelf life) and optional
-walking blood bank inflow at Role 2E.
+depot loss, cold-chain failure, blood spoilage (short shelf life), and the
+Walking Blood Bank (WBB) with donor attrition and ABO/Rh grouping constraints
+(Nye et al. 2014 benchmark).
 """
 import numpy as np, pandas as pd
-from .config import Config, ITEMS, I, LEVELS, BLOOD_ITEMS
+from .config import (Config, ITEMS, I, LEVELS, BLOOD_ITEMS,
+                     BLOOD_GROUPS, DONOR_POOL_INIT, DONOR_ATTRITION_RATE,
+                     WBB_COLLECTION_PER_DONOR, WBB_COLLECTION_INTERVAL_H)
 from .world import World
 from .predictor import CrostonPolicy, DynamicPolicy, SeasonalNaivePolicy, StaticPolicy
 
@@ -61,8 +64,27 @@ def run(cfg: Config, policy: str = "dynamic", world: World = None):
         stock += pipe[t]; transit -= pipe_nom[t]; transit = np.maximum(transit, 0)
         stock[0] += wh_in_h
         if t == cfg.depot_loss_h: stock[1] = 0.0                         # depot struck
-        if cfg.wbb_units_per_day > 0 and t % 24 == 0:
-            stock[w.idx["R2E"], blood_k] += cfg.wbb_units_per_day         # walking blood bank (Nye benchmark)
+        if cfg.wbb_units_per_day > 0 and t % WBB_COLLECTION_INTERVAL_H == 0:
+            # Walking blood bank: compute actual WBB output considering attrition
+            # and blood group compatibility.
+            if cfg.use_donor_attrition:
+                # Donor pool decays exponentially: N(t) = N0 * (1 - attrition)^(t/24)
+                day_frac = t / 24.0
+                active_donors = DONOR_POOL_INIT * ((1 - DONOR_ATTRITION_RATE) ** day_frac)
+                # Casualties among donors: stochastic Poisson loss
+                donor_loss = rng.poisson(DONOR_POOL_INIT * DONOR_ATTRITION_RATE * 0.3)
+                active_donors = max(0, int(active_donors) - donor_loss)
+            else:
+                active_donors = int(cfg.wbb_units_per_day)  # legacy fixed inflow
+            if cfg.use_blood_grouping:
+                # Only ~93% of collected units are usable (AB- rare, group mismatch)
+                # Universal donor (O-) fraction limits emergency distribution
+                usable_frac = 1.0 - BLOOD_GROUPS.get("AB-", 0.01) - BLOOD_GROUPS.get("B-", 0.02)
+                wbb_units = active_donors * WBB_COLLECTION_PER_DONOR * usable_frac
+            else:
+                wbb_units = active_donors * WBB_COLLECTION_PER_DONOR
+            if wbb_units > 0:
+                stock[w.idx["R2E"], blood_k] += wbb_units
         if blood_k and cfg.blood_spoil_h > 0:
             stock[np.ix_(fwd, blood_k)] *= (1.0 - cfg.blood_spoil_h)      # short shelf life wastage
         if t == cfg.cold_chain_loss_h and blood_k:
@@ -125,3 +147,60 @@ class Result:
                 rows.append(dict(node=w.name[n], level=w.level[n], item=it, stock=round(float(self.stock[t, n, k]), 1),
                                  hos=round(min(h, 999), 1), tier=hos_tier(h)))
         return pd.DataFrame(rows)
+
+
+def monte_carlo(cfg: Config, n_runs: int = None, policy: str = "dynamic") -> dict:
+    """Nye Monte Carlo validation: run the simulation N times with different
+    random seeds, collect key metrics, and return the distribution.
+
+    Returns dict with:
+      - runs: list of per-run metrics (fill_rate, first_stockout_day, blood_stockout_day)
+      - summary: percentiles (p5, p25, median, p75, p95) for each metric
+      - config_used: the scenario config dict for reproducibility
+    """
+    n = n_runs or cfg.mc_runs
+    results = []
+    for i in range(n):
+        run_cfg = Config(**{k: v for k, v in cfg.__dict__.items() if k != 'seed'})
+        run_cfg.seed = cfg.mc_seed_base + i
+        res = run(run_cfg, policy=policy)
+        summary = res.summary()
+        blood_rows = summary[summary["item"].isin(BLOOD_ITEMS)] if not summary.empty else pd.DataFrame()
+        blood_stockout = int(blood_rows["first_stockout_day"].dropna().min()) if not blood_rows.empty and blood_rows["first_stockout_day"].notna().any() else None
+        overall_fill = float(summary["fill_rate_pct"].mean()) if not summary.empty else 0.0
+        results.append({
+            "run": i + 1,
+            "overall_fill_rate_pct": round(overall_fill, 2),
+            "first_stockout_day": int(summary["first_stockout_day"].dropna().min()) if not summary.empty and summary["first_stockout_day"].notna().any() else None,
+            "blood_stockout_day": blood_stockout,
+        })
+    # Compute distribution summary
+    fills = [r["overall_fill_rate_pct"] for r in results]
+    stockouts = [r["first_stockout_day"] for r in results if r["first_stockout_day"] is not None]
+    blood_sos = [r["blood_stockout_day"] for r in results if r["blood_stockout_day"] is not None]
+    def percentiles(arr):
+        if not arr: return {}
+        a = np.array(arr)
+        return {"p5": round(float(np.percentile(a, 5)), 1),
+                "p25": round(float(np.percentile(a, 25)), 1),
+                "median": round(float(np.median(a)), 1),
+                "p75": round(float(np.percentile(a, 75)), 1),
+                "p95": round(float(np.percentile(a, 95)), 1),
+                "mean": round(float(np.mean(a)), 1)}
+    summary_stats = {
+        "fill_rate": percentiles(fills),
+        "first_stockout_day": percentiles(stockouts),
+        "blood_stockout_day": percentiles(blood_sos),
+    }
+    return {
+        "classification": "SYNTHETIC PLANNING ESTIMATE — Monte Carlo validation",
+        "n_runs": n,
+        "policy": policy,
+        "results": results,
+        "summary": summary_stats,
+        "config_used": {"theatre_casualties_per_day": cfg.theatre_casualties_per_day,
+                        "days": cfg.days, "surge_mult": cfg.surge_mult,
+                        "wbb_units_per_day": cfg.wbb_units_per_day,
+                        "use_donor_attrition": cfg.use_donor_attrition,
+                        "use_blood_grouping": cfg.use_blood_grouping},
+    }

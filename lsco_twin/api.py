@@ -9,7 +9,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from lsco_twin.config import Config, FACTORS, ITEMS, TRIAGE_MIX
 from lsco_twin.predictor import C_MAX, C_MIN
-from lsco_twin.simulator import TIER_ACTIONS, hos_tier, run
+from lsco_twin.simulator import TIER_ACTIONS, hos_tier, run, monte_carlo
 
 twin_bp = Blueprint("twin", __name__, url_prefix="/twin")
 ALLOWED = {
@@ -26,6 +26,9 @@ ALLOWED = {
     "order_fail_p": float,
     "wh_init_days": float,
     "seed": int,
+    "use_blood_grouping": lambda x: x.lower() in ("true", "1", "yes"),
+    "use_donor_attrition": lambda x: x.lower() in ("true", "1", "yes"),
+    "mc_runs": int,
 }
 
 
@@ -38,7 +41,7 @@ def _cfg_from(args):
         raise ValueError("days must be 1-60")
     if not 1 <= cfg.surge_mult <= 10:
         raise ValueError("surge_mult must be 1-10")
-    if not 0 <= cfg.surge_start_h <= cfg.T:
+    if "surge_start_h" in values and not 0 <= cfg.surge_start_h < cfg.T:
         raise ValueError("surge_start_h must be within the simulation")
     if not 0 <= cfg.evac_factor <= 5:
         raise ValueError("evac_factor must be 0-5")
@@ -234,5 +237,30 @@ def live_forecasts():
                 "predictions": predictions,
             }
         )
+    except (ValueError, TypeError, OverflowError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@twin_bp.route("/monte-carlo")
+def mc_endpoint():
+    """Nye Monte Carlo validation: run the simulation N times with stochastic
+    variation, return distribution of fill rates and stock-out days."""
+    try:
+        kwargs = {}
+        for key, cast in ALLOWED.items():
+            raw = request.args.get(key)
+            if raw is None:
+                continue
+            try:
+                if callable(cast) and not isinstance(cast, type):
+                    kwargs[key] = cast(raw)
+                else:
+                    kwargs[key] = cast(raw)
+            except (ValueError, TypeError):
+                return jsonify({"error": f"{key} must be {cast}"}), 400
+        n_runs = kwargs.pop("mc_runs", 50)
+        cfg = Config(**kwargs)
+        result = monte_carlo(cfg, n_runs=n_runs)
+        return jsonify(result)
     except (ValueError, TypeError, OverflowError) as exc:
         return jsonify({"error": str(exc)}), 400

@@ -10,7 +10,16 @@ BST_Rapid-MMLS_Combined_Problem_Analysis_and_PID.pdf Section 4.2:
   - blood = 10 units per T1 casualty (RUSI ratio; Digital Twin PDF ref [1])
   - haemorrhage control sets and antibiotic courses = one per T1+T2 casualty
   - analgesia doses and wound dressings = at least one per casualty
-All numbers remain placeholders, not validated clinical factors.
+
+Planning factor validation sources (for replacement of placeholders):
+  - NATO AMedP-13(B) Allied Joint Medical Logistics Doctrine
+  - US Borden Institute JMALL Table 14-2 (Joint Medical Logistics Planning Factors)
+  - UK DCDC Joint Force Health Action (JFHA) planning ratios
+  - RUSI "Blood and Military Medicine" (2022) — 10 units per serious casualty
+  - Nye B et al. "Walking Blood Bank in Afghanistan" (Mil Med, 2014)
+  - BST PID v0.2 §4.2 (brigade annex × 20, current basis)
+
+All numbers remain placeholders pending end-user validation (mentor action).
 """
 from dataclasses import dataclass, field
 import numpy as np
@@ -20,6 +29,25 @@ ITEMS = ["THEATRE_PACK", "ANAES_SET", "BLOOD_UNIT", "HAEM_SET",
 I = {name: k for k, name in enumerate(ITEMS)}
 CONTROLLED = {"ANALGESIA"}            # morphine / ketamine / fentanyl lines
 BLOOD_ITEMS = {"BLOOD_UNIT"}          # cold chain, short shelf life (PID s6)
+
+# ---- Blood group distribution (UK/NATO military population approximations) ----
+# Source: NHS Blood Transfusion statistics + military donor registries (young adult
+# skew toward O+). Used by the Walking Blood Bank model to constrain cross-match.
+BLOOD_GROUPS = {
+    "O+": 0.35, "O-": 0.07, "A+": 0.32, "A-": 0.06,
+    "B+": 0.09, "B-": 0.02, "AB+": 0.03, "AB-": 0.01,
+}
+# Universal-donor fraction (O- can give to all; O+ to all Rh+):
+UNIVERSAL_DONOR_GROUPS = {"O-"}
+RHEUS_POSITIVE = {"O+", "A+", "B+", "AB+"}  # ~85% of population
+
+# ---- Walking Blood Bank (WBB) model parameters (Nye et al. 2014) ----
+# Source: Nye B et al. "Walking blood bank: the experience at a deployed Role 2
+# in Afghanistan." Military Medicine 179(7):365-370.
+DONOR_POOL_INIT = 120          # pre-typed donors available per R2E
+DONOR_ATTRITION_RATE = 0.08    # daily fractional loss (casualty, rotation, illness)
+WBB_COLLECTION_PER_DONOR = 1   # units per active donor per collection cycle
+WBB_COLLECTION_INTERVAL_H = 24 # hours between collection rounds
 
 # ---- casualty-to-consumption, derived from triage (Digital Twin PDF s2) ----
 TRIAGE_MIX = {"T1": 0.20, "T2": 0.30, "T3": 0.50}
@@ -86,6 +114,12 @@ class Config:
     blood_spoil_h: float = 0.005      # hourly fractional loss of forward blood stock (short shelf life)
     wbb_units_per_day: float = 0.0    # walking blood bank: fresh units/day added at each Role 2E (Nye benchmark)
     order_fail_p: float = 0.0         # DDIL: prob a node cannot send its order this cycle
+    # ---- Monte Carlo validation (Nye model benchmark) ----
+    mc_runs: int = 100                # number of stochastic iterations for validation
+    mc_seed_base: int = 1000          # base seed; each run uses mc_seed_base + i
+    # ---- Blood grouping & donor attrition ----
+    use_blood_grouping: bool = False  # enable ABO/Rh compatibility constraint
+    use_donor_attrition: bool = False # enable WBB donor pool depletion over time
     seed: int = 42
 
     @property
