@@ -281,6 +281,7 @@ def register_item():
             "cotccc":                   str(data.get("cotccc", "—")),
             "sterile":                  str(data.get("sterile", "YES")),
             "notes":                    str(data.get("notes", "—")),
+            "nsn":                      str(data.get("nsn", "—")),
             
             # Metadata
             "last_updated":             datetime.now(),
