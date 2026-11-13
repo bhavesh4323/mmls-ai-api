@@ -49,6 +49,22 @@ DONOR_ATTRITION_RATE = 0.08    # daily fractional loss (casualty, rotation, illn
 WBB_COLLECTION_PER_DONOR = 1   # units per active donor per collection cycle
 WBB_COLLECTION_INTERVAL_H = 24 # hours between collection rounds
 
+# Accepted input ranges for the donor model. /twin/blood-model reports these so
+# the dashboard can show exactly what extent each control covers.
+DONOR_POOL_RANGE = (10, 1000)
+DONOR_ATTRITION_RANGE = (0.0, 0.50)
+
+
+def usable_blood_fraction(dist=None):
+    """Fraction of collected units that can actually be transfused.
+
+    ABO/Rh compatibility caps what a mixed collection is worth: the rare groups
+    (AB- 0.01, B- 0.02 in the default UK/NATO distribution) cannot be covered by
+    the pool, so 0.97 of collected units are usable.
+    """
+    d = dist or BLOOD_GROUPS
+    return round(1.0 - d.get("AB-", 0.01) - d.get("B-", 0.02), 4)
+
 # ---- casualty-to-consumption, derived from triage (Digital Twin PDF s2) ----
 TRIAGE_MIX = {"T1": 0.20, "T2": 0.30, "T3": 0.50}
 SURGICAL_PER_CASUALTY = TRIAGE_MIX["T1"] + 0.5 * TRIAGE_MIX["T2"]   # 0.35 -> 700/day at 2,000
@@ -120,7 +136,14 @@ class Config:
     # ---- Blood grouping & donor attrition ----
     use_blood_grouping: bool = False  # enable ABO/Rh compatibility constraint
     use_donor_attrition: bool = False # enable WBB donor pool depletion over time
+    # Magnitudes behind the two switches above (Nye et al. 2014 defaults).
+    donor_pool_init: int = DONOR_POOL_INIT
+    donor_attrition_rate: float = DONOR_ATTRITION_RATE
+    blood_group_dist: dict = field(default_factory=lambda: dict(BLOOD_GROUPS))
     seed: int = 42
 
     @property
     def T(self): return self.days * 24
+
+    @property
+    def usable_fraction(self): return usable_blood_fraction(self.blood_group_dist)

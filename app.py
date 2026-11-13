@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pymongo import MongoClient
+from bson.objectid import ObjectId
+from bson.errors import InvalidId
 from lsco_twin.api import twin_bp
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -23,6 +25,7 @@ client     = MongoClient(MONGO_URI)
 db         = client["mmls_ai"]
 inventory_col = db["inventory"]
 audit_col     = db["audit_log"]
+resupply_col  = db["resupply_requests"]
 
 def _inventory_collections():
     return inventory_col, audit_col
@@ -209,10 +212,15 @@ def hours_of_supply():
             rate  = item.get("avg_consumption_per_hour", 1.0)
             stock = item.get("current_stock", 0)
             hos, tier = compute_hos(stock, rate)
+            echelon = item.get("echelon", "Role1")
             result.append({
                 "item_id": item["item_id"], "item_name": item["item_name"],
                 "hours_of_supply": hos, "hos_tier": tier,
-                "current_stock": stock, "echelon": item.get("echelon","Role1")
+                "current_stock": stock, "echelon": echelon,
+                "reorder_point_h": REORDER_H.get(echelon, 12),
+                "target_h": TARGET_H.get(echelon, 48),
+                "needs_reorder": hos <= REORDER_H.get(echelon, 12),
+                "suggested_qty": max(suggested_resupply_qty(item), 0),
             })
         return jsonify(result)
     except Exception as e:
@@ -313,13 +321,162 @@ def reset_database():
         inv_result = inventory_col.delete_many({})
         # Wipe the audit log so you start with a completely clean slate
         audit_result = audit_col.delete_many({})
+        resupply_result = resupply_col.delete_many({})
         
         return jsonify({
             "message": "Database wiped successfully",
             "inventory_deleted": inv_result.deleted_count,
-            "audit_deleted": audit_result.deleted_count
+            "audit_deleted": audit_result.deleted_count,
+            "resupply_deleted": resupply_result.deleted_count
         }), 200
         
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ── ENDPOINT 10 — Resupply requests (how a medic reorders) ───────────────────
+# Mirrors the digital twin's reorder policy: a node orders when its hours of
+# supply fall below the reorder point, and orders enough to reach its target
+# hours of supply. The medic only presses a button; the quantity is computed
+# here, a logistician (Role 3) approves, and approval credits the stock.
+TARGET_H = {"Role1": 48, "Role2": 48, "Role3": 72}
+REORDER_H = {"Role1": 12, "Role2": 12, "Role3": 36}
+
+def suggested_resupply_qty(item, pending=0):
+    """Units needed to lift `item` from current stock back to its target HoS.
+
+    Zero or negative means the target is already covered (including by requests
+    still awaiting approval).
+    """
+    echelon = item.get("echelon", "Role1")
+    rate    = float(item.get("avg_consumption_per_hour", 0) or 0)
+    stock   = float(item.get("current_stock", 0) or 0)
+    target  = TARGET_H.get(echelon, 48) * rate
+    return int(np.ceil(target - stock - pending))
+
+@app.route("/resupply_request", methods=["POST"])
+def resupply_request():
+    try:
+        data    = request.json or {}
+        item_id = str(data.get("item_id", "")).strip()
+        item    = inventory_col.find_one({"item_id": item_id})
+        if not item:
+            return jsonify({"error": f"{item_id} not found"}), 404
+
+        pending = sum(r.get("qty", 0) for r in resupply_col.find(
+            {"item_id": item_id, "status": "PENDING"}, {"qty": 1}))
+        qty = data.get("qty")
+        if qty is None:
+            qty = suggested_resupply_qty(item, pending)
+            if qty <= 0:
+                return jsonify({
+                    "error": "no resupply needed — current stock and pending requests already "
+                             f"cover the {TARGET_H.get(item.get('echelon','Role1'), 48)}h target",
+                    "suggested_qty": qty, "pending_qty": pending,
+                }), 409
+        qty = int(qty)
+        if not 1 <= qty <= 100000:
+            return jsonify({"error": "qty must be between 1 and 100000"}), 400
+
+        echelon = item.get("echelon", "Role1")
+        rate    = float(item.get("avg_consumption_per_hour", 0) or 0)
+        stock   = float(item.get("current_stock", 0) or 0)
+        hos, tier = compute_hos(stock, rate)
+        doc = {
+            "item_id":      item_id,
+            "item_name":    item.get("item_name", item_id),
+            "echelon":      echelon,
+            "qty":          qty,
+            "status":       "PENDING",
+            "requested_by": str(data.get("requested_by", "unknown")),
+            "reason":       str(data.get("reason", ""))[:300],
+            "hos_at_request":   hos,
+            "tier_at_request":  tier,
+            "stock_at_request": stock,
+            "created_at":   datetime.now(),
+            "decided_by":   None,
+            "decided_at":   None,
+            "decision_note": "",
+        }
+        resupply_col.insert_one(doc)
+        audit_col.insert_one({
+            "event_type": "RESUPPLY_REQUEST", "item_id": item_id,
+            "item_name": doc["item_name"], "qty_used": 0,
+            "timestamp": doc["created_at"], "user": doc["requested_by"],
+            "controlled": item.get("controlled_drug", False),
+            "detail": f"requested {qty} units (HoS {hos}h, {tier})",
+        })
+        doc["_id"] = str(doc["_id"])
+        return jsonify(doc), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/resupply_requests", methods=["GET"])
+def resupply_requests():
+    try:
+        query = {}
+        status = request.args.get("status")
+        if status:
+            query["status"] = status.upper()
+        echelon = request.args.get("echelon")
+        if echelon:
+            query["echelon"] = echelon
+        try:
+            limit = min(max(int(request.args.get("limit", 100)), 1), 500)
+        except ValueError:
+            return jsonify({"error": "limit must be an integer"}), 400
+        rows = list(resupply_col.find(query).sort("created_at", -1).limit(limit))
+        for row in rows:
+            row["_id"] = str(row["_id"])
+            for field in ("created_at", "decided_at"):
+                if isinstance(row.get(field), datetime):
+                    row[field] = row[field].strftime("%Y-%m-%d %H:%M:%S")
+        return jsonify(rows)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/resupply_request/<req_id>/decision", methods=["POST"])
+def resupply_decision(req_id):
+    try:
+        data   = request.json or {}
+        action = str(data.get("action", "")).lower()
+        if action not in ("approve", "reject"):
+            return jsonify({"error": "action must be approve or reject"}), 400
+        try:
+            oid = ObjectId(req_id)
+        except (InvalidId, TypeError):
+            return jsonify({"error": "invalid request id"}), 400
+        doc = resupply_col.find_one({"_id": oid})
+        if not doc:
+            return jsonify({"error": "resupply request not found"}), 404
+        if doc["status"] != "PENDING":
+            return jsonify({"error": f"request is already {doc['status']}"}), 409
+
+        decided_by = str(data.get("decided_by", "unknown"))
+        new_stock  = None
+        if action == "approve":
+            item = inventory_col.find_one({"item_id": doc["item_id"]})
+            if not item:
+                return jsonify({"error": f"{doc['item_id']} no longer in inventory"}), 404
+            new_stock = int(item.get("current_stock", 0)) + int(doc["qty"])
+            inventory_col.update_one({"item_id": doc["item_id"]},
+                {"$set": {"current_stock": new_stock, "last_updated": datetime.now()}})
+        resupply_col.update_one({"_id": oid}, {"$set": {
+            "status": "APPROVED" if action == "approve" else "REJECTED",
+            "decided_by": decided_by,
+            "decided_at": datetime.now(),
+            "decision_note": str(data.get("note", ""))[:300],
+        }})
+        audit_col.insert_one({
+            "event_type": "RESUPPLY_APPROVED" if action == "approve" else "RESUPPLY_REJECTED",
+            "item_id": doc["item_id"], "item_name": doc["item_name"], "qty_used": 0,
+            "timestamp": datetime.now(), "user": decided_by,
+            "controlled": False,
+            "detail": (f"approved {doc['qty']} units, stock now {new_stock}"
+                       if action == "approve" else f"rejected {doc['qty']} units"),
+        })
+        return jsonify({"message": "Request approved" if action == "approve" else "Request rejected",
+                        "item_id": doc["item_id"],
+                        "qty": doc["qty"], "new_stock": new_stock}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

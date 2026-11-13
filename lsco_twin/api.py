@@ -7,9 +7,13 @@ import math
 import numpy as np
 from flask import Blueprint, current_app, jsonify, request
 
-from lsco_twin.config import Config, FACTORS, ITEMS, TRIAGE_MIX
+from lsco_twin.config import (BLOOD_GROUPS, Config, DONOR_ATTRITION_RANGE,
+                              DONOR_ATTRITION_RATE, DONOR_POOL_INIT,
+                              DONOR_POOL_RANGE, FACTORS, ITEMS, TRIAGE_MIX,
+                              WBB_COLLECTION_INTERVAL_H, WBB_COLLECTION_PER_DONOR)
 from lsco_twin.predictor import C_MAX, C_MIN
-from lsco_twin.simulator import TIER_ACTIONS, hos_tier, run, monte_carlo
+from lsco_twin.simulator import (TIER_ACTIONS, hos_tier, run, monte_carlo,
+                                 wbb_projection)
 
 twin_bp = Blueprint("twin", __name__, url_prefix="/twin")
 ALLOWED = {
@@ -28,6 +32,8 @@ ALLOWED = {
     "seed": int,
     "use_blood_grouping": lambda x: x.lower() in ("true", "1", "yes"),
     "use_donor_attrition": lambda x: x.lower() in ("true", "1", "yes"),
+    "donor_pool_init": int,
+    "donor_attrition_rate": float,
     "mc_runs": int,
 }
 
@@ -35,18 +41,26 @@ ALLOWED = {
 def _cfg_from(args):
     values = {key: cast(args[key]) for key, cast in ALLOWED.items() if key in args}
     cfg = Config(**values)
+    _validate(cfg)
+    if not all(math.isfinite(float(value)) for value in values.values()):
+        raise ValueError("numeric parameters must be finite")
+    return cfg, tuple(sorted(values.items()))
+
+
+def _validate(cfg: Config):
+    """Range checks shared by /simulate, /hos and /monte-carlo."""
     if not 100 <= cfg.theatre_casualties_per_day <= 10000:
         raise ValueError("theatre_casualties_per_day must be 100-10000")
     if not 1 <= cfg.days <= 60:
         raise ValueError("days must be 1-60")
     if not 1 <= cfg.surge_mult <= 10:
         raise ValueError("surge_mult must be 1-10")
-    if "surge_start_h" in values and cfg.surge_start_h < 0:
+    if cfg.surge_start_h < 0:
         raise ValueError("surge_start_h must be non-negative")
-    if not 0 <= cfg.evac_factor <= 5:
-        raise ValueError("evac_factor must be 0-5")
-    if not 0 <= cfg.lift_factor <= 5:
-        raise ValueError("lift_factor must be 0-5")
+    if not 0 <= cfg.evac_factor <= 30:
+        raise ValueError("evac_factor must be 0-30 (multiplier on hour-based evacuation legs)")
+    if not 0 <= cfg.lift_factor <= 30:
+        raise ValueError("lift_factor must be 0-30 (multiplier on hour-based resupply legs)")
     if cfg.depot_loss_h < -1:
         raise ValueError("depot_loss_h must be -1 or a positive hour")
     if cfg.cold_chain_loss_h < -1:
@@ -61,9 +75,12 @@ def _cfg_from(args):
         raise ValueError("wh_init_days must be 0-365")
     if not 0 <= cfg.seed <= 2**32 - 1:
         raise ValueError("seed must be between 0 and 4294967295")
-    if not all(math.isfinite(float(value)) for value in values.values()):
-        raise ValueError("numeric parameters must be finite")
-    return cfg, tuple(sorted(values.items()))
+    lo, hi = DONOR_POOL_RANGE
+    if not lo <= cfg.donor_pool_init <= hi:
+        raise ValueError(f"donor_pool_init must be {lo}-{hi} donors per Role 2E")
+    lo, hi = DONOR_ATTRITION_RANGE
+    if not lo <= cfg.donor_attrition_rate <= hi:
+        raise ValueError(f"donor_attrition_rate must be {lo}-{hi} (fraction lost per day)")
 
 
 @lru_cache(maxsize=32)
@@ -263,6 +280,7 @@ def mc_endpoint():
         if policy not in ("static", "dynamic"):
             return jsonify({"error": "policy must be static or dynamic"}), 400
         cfg = Config(**kwargs)
+        _validate(cfg)
         # Free-tier guard: keep the request inside Render's ~100s idle timeout
         # (0.1 CPU ≈ 2 simulated run-hours per second of wall time).
         max_run_hours = 15000
@@ -280,5 +298,43 @@ def mc_endpoint():
         result["note"] = ("run count capped to fit free-tier compute limits"
                           if n_runs < requested_runs else None)
         return jsonify(result)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@twin_bp.get("/blood-model")
+def blood_model():
+    """Expose the ABO/Rh + donor-attrition inputs, their accepted ranges, and the
+    resulting donor-pool projection, so the two checkboxes can be quantified."""
+    try:
+        cfg, _ = _cfg_from(request.args)
+        projection = wbb_projection(cfg)
+        return jsonify(
+            {
+                "classification": "synthetic planning estimate - Nye et al. 2014 WBB model",
+                "inputs": {
+                    "use_blood_grouping": cfg.use_blood_grouping,
+                    "use_donor_attrition": cfg.use_donor_attrition,
+                    "wbb_units_per_day": cfg.wbb_units_per_day,
+                    "donor_pool_init": cfg.donor_pool_init,
+                    "donor_attrition_rate": cfg.donor_attrition_rate,
+                },
+                "ranges": {
+                    "donor_pool_init": {"min": DONOR_POOL_RANGE[0], "max": DONOR_POOL_RANGE[1],
+                                        "default": DONOR_POOL_INIT, "unit": "pre-typed donors per Role 2E"},
+                    "donor_attrition_rate": {"min": DONOR_ATTRITION_RANGE[0], "max": DONOR_ATTRITION_RANGE[1],
+                                             "default": DONOR_ATTRITION_RATE, "unit": "fraction of pool lost per day"},
+                    "wbb_units_per_day": {"min": 0, "max": 200, "default": 0,
+                                          "unit": "units/day per Role 2E (flat inflow when attrition is off)"},
+                },
+                "blood_group_distribution": BLOOD_GROUPS,
+                "collection": {
+                    "units_per_donor": WBB_COLLECTION_PER_DONOR,
+                    "interval_h": WBB_COLLECTION_INTERVAL_H,
+                },
+                "usable_fraction": cfg.usable_fraction,
+                "projection": projection.to_dict("records"),
+            }
+        )
     except (ValueError, TypeError, OverflowError) as exc:
         return jsonify({"error": str(exc)}), 400

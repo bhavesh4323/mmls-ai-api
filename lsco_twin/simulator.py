@@ -7,7 +7,6 @@ Walking Blood Bank (WBB) with donor attrition and ABO/Rh grouping constraints
 """
 import numpy as np, pandas as pd
 from .config import (Config, ITEMS, I, LEVELS, BLOOD_ITEMS,
-                     BLOOD_GROUPS, DONOR_POOL_INIT, DONOR_ATTRITION_RATE,
                      WBB_COLLECTION_PER_DONOR, WBB_COLLECTION_INTERVAL_H)
 from .world import World
 from .predictor import CrostonPolicy, DynamicPolicy, SeasonalNaivePolicy, StaticPolicy
@@ -29,6 +28,41 @@ def hos_tier(h):
     if h >= 6:  return "AMBER"
     if h >= 2:  return "RED"
     return "PURPLE"
+
+def wbb_units_at(cfg: Config, t: int, rng=None) -> float:
+    """Units a walking blood bank adds per Role 2E node at hour t (Nye 2014).
+
+    Attrition off: `wbb_units_per_day` is taken directly as the active donor
+    count, i.e. a flat planned inflow. Attrition on: the pool starts at
+    `donor_pool_init` and decays by `donor_attrition_rate` per day plus a
+    stochastic casualty loss, so `wbb_units_per_day` is only the on/off gate.
+    ABO/Rh grouping scales the collection by the usable fraction.
+    """
+    if cfg.use_donor_attrition:
+        active = cfg.donor_pool_init * ((1 - cfg.donor_attrition_rate) ** (t / 24.0))
+        if rng is not None:
+            casualty_loss = rng.poisson(cfg.donor_pool_init * cfg.donor_attrition_rate * 0.3)
+            active = max(0, int(active) - casualty_loss)
+        else:
+            active = int(active)
+    else:
+        active = int(cfg.wbb_units_per_day)
+    units = active * WBB_COLLECTION_PER_DONOR
+    return units * cfg.usable_fraction if cfg.use_blood_grouping else units
+
+def wbb_projection(cfg: Config) -> pd.DataFrame:
+    """Deterministic day-by-day donor pool / collection / usable-unit table."""
+    rows = []
+    for day in range(cfg.days + 1):
+        if cfg.use_donor_attrition:
+            donors = int(cfg.donor_pool_init * ((1 - cfg.donor_attrition_rate) ** day))
+        else:
+            donors = int(cfg.wbb_units_per_day)
+        collected = donors * WBB_COLLECTION_PER_DONOR
+        usable = collected * cfg.usable_fraction if cfg.use_blood_grouping else float(collected)
+        rows.append(dict(day=day, active_donors=donors, units_collected=collected,
+                         units_usable=round(usable, 1)))
+    return pd.DataFrame(rows)
 
 def run(cfg: Config, policy: str = "dynamic", world: World = None, light: bool = False):
     w = world or World(cfg)
@@ -68,25 +102,8 @@ def run(cfg: Config, policy: str = "dynamic", world: World = None, light: bool =
         stock += pipe[t]; transit -= pipe_nom[t]; transit = np.maximum(transit, 0)
         stock[0] += wh_in_h
         if t == cfg.depot_loss_h: stock[1] = 0.0                         # depot struck
-        if cfg.wbb_units_per_day > 0 and t % WBB_COLLECTION_INTERVAL_H == 0:
-            # Walking blood bank: compute actual WBB output considering attrition
-            # and blood group compatibility.
-            if cfg.use_donor_attrition:
-                # Donor pool decays exponentially: N(t) = N0 * (1 - attrition)^(t/24)
-                day_frac = t / 24.0
-                active_donors = DONOR_POOL_INIT * ((1 - DONOR_ATTRITION_RATE) ** day_frac)
-                # Casualties among donors: stochastic Poisson loss
-                donor_loss = rng.poisson(DONOR_POOL_INIT * DONOR_ATTRITION_RATE * 0.3)
-                active_donors = max(0, int(active_donors) - donor_loss)
-            else:
-                active_donors = int(cfg.wbb_units_per_day)  # legacy fixed inflow
-            if cfg.use_blood_grouping:
-                # Only ~93% of collected units are usable (AB- rare, group mismatch)
-                # Universal donor (O-) fraction limits emergency distribution
-                usable_frac = 1.0 - BLOOD_GROUPS.get("AB-", 0.01) - BLOOD_GROUPS.get("B-", 0.02)
-                wbb_units = active_donors * WBB_COLLECTION_PER_DONOR * usable_frac
-            else:
-                wbb_units = active_donors * WBB_COLLECTION_PER_DONOR
+        if t % WBB_COLLECTION_INTERVAL_H == 0 and (cfg.wbb_units_per_day > 0 or cfg.use_donor_attrition):
+            wbb_units = wbb_units_at(cfg, t, rng)
             if wbb_units > 0:
                 stock[w.idx["R2E"], blood_k] += wbb_units
         if blood_k and cfg.blood_spoil_h > 0:
@@ -208,5 +225,8 @@ def monte_carlo(cfg: Config, n_runs: int = None, policy: str = "dynamic") -> dic
                         "days": cfg.days, "surge_mult": cfg.surge_mult,
                         "wbb_units_per_day": cfg.wbb_units_per_day,
                         "use_donor_attrition": cfg.use_donor_attrition,
-                        "use_blood_grouping": cfg.use_blood_grouping},
+                        "use_blood_grouping": cfg.use_blood_grouping,
+                        "donor_pool_init": cfg.donor_pool_init,
+                        "donor_attrition_rate": cfg.donor_attrition_rate,
+                        "usable_fraction": cfg.usable_fraction},
     }
