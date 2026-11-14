@@ -282,6 +282,7 @@ def register_item():
             "sterile":                  str(data.get("sterile", "YES")),
             "notes":                    str(data.get("notes", "—")),
             "nsn":                      str(data.get("nsn", "—")),
+            "barcode_raw":              str(data.get("barcode_raw", "—")),
             
             # Metadata
             "last_updated":             datetime.now(),
